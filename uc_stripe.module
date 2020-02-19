@@ -1,0 +1,1183 @@
+<?php
+
+/**
+ * @file
+ * Integrates Stripe payment services.
+ */
+
+
+require_once dirname(__FILE__) . '/uc_stripe.inc';
+require_once dirname(__FILE__) . '/uc_stripe.admin.inc';
+
+define('UC_STRIPE_NOT_COMPLETED', 0);
+define('UC_STRIPE_LIMIT_AUTHENTICATE_PAYMENT', 25);
+define('UC_STRIPE_ENDPOINT', 'uc_stripe/endpoint');
+
+/**
+ * Implements hook_libraries_info().
+ */
+function uc_stripe_libraries_info() {
+  $libraries['stripe'] = array(
+    'name' => 'Stripe PHP Library',
+    'vendor url' => 'http://stripe.com',
+    'download url' => 'https://github.com/stripe/stripe-php/releases',
+    'download file url' => 'https://github.com/stripe/stripe-php/archive/v6.38.0.tar.gz',
+    'version arguments' => array(
+      'file' => 'VERSION',
+      'pattern' => '/(\d+\.\d+\.\d+)/',
+    ),
+    'versions' => array(
+      '6.38.0' => array(
+        'files' => array(
+          'php' => array(
+            'init.php',
+          )
+        ),
+        'stripe_api_version' => '2019-05-16'
+      )
+    ),
+  );
+
+  return $libraries;
+}
+
+/**
+ * Implement hook_permission().
+ */
+function uc_stripe_permission() {
+  return array(
+    'administer uc_stripe' => array(
+      'title' => t("Administer Stripe's Ubercart"),
+      'description' => t('Allows to change settings.'),
+    ),
+    'access uc_stripe authenticate payment' => array(
+      'title' => t('Access to Stripe of user for authenticate payment'),
+      'description' => t('Allows user send request manually.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function uc_stripe_menu() {
+  $items = array();
+
+  $items['uc_stripe/ajax/confirm_payment'] = array(
+    'page callback' => 'uc_stripe_confirm_payment',
+    'delivery callback' => 'drupal_json_output',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+
+  if (module_exists('uc_recurring')) {
+    $items['admin/store/settings/recurring/general'] = array(
+      'title' => 'Recurring payments',
+      'type' => MENU_DEFAULT_LOCAL_TASK,
+    );
+    $items['admin/store/settings/recurring/uc_stripe'] = array(
+      'title' => 'Stripe',
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('uc_stripe_authenticate_payment_list'),
+      'access arguments' => array('administer uc_stripe'),
+      'type' => MENU_LOCAL_TASK,
+      'file' => 'uc_stripe.pages.inc',
+    );
+
+    $items['user/%user/uc_stripe_authenticate_payment'] = array(
+      'title' => 'Stripe authentication payment',
+      'page callback' => 'uc_stripe_user_list_authenticate_payment',
+      'access arguments' => array('access uc_stripe authenticate payment'),
+      'type' => MENU_LOCAL_TASK,
+      'file' => 'uc_stripe.pages.inc',
+    );
+    $items['user/%user/uc_stripe_authenticate_payment/%hash'] = array(
+      'title' => 'Stripe authentication payment',
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('uc_stripe_user_authenticate_payment', 1, 3),
+      'access arguments' => array('access uc_stripe authenticate payment'),
+      'type' => MENU_LOCAL_TASK,
+      'file' => 'uc_stripe.pages.inc',
+    );
+  }
+  $items[UC_STRIPE_ENDPOINT] = array(
+    'title' => 'UC-stripe endpoint',
+    'page callback' => 'uc_stripe_endpoint',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_payment_gateway().
+ */
+function uc_stripe_uc_payment_gateway() {
+  $gateways = array();
+  $gateways[] = array(
+    'id' => 'uc_stripe',
+    'title' => t('Stripe Gateway'),
+    'description' => t('Process card payments using Stripe JS.'),
+    'settings' => 'uc_stripe_settings_form',
+    'credit' => 'uc_stripe_charge',
+  );
+  return $gateways;
+}
+
+/**
+ * Implements hook_recurring_info().
+ */
+function uc_stripe_recurring_info() {
+  $items['uc_stripe'] = array(
+    'name' => t('Stripe'),
+    'payment method' => 'credit',
+    'module' => 'uc_recurring',
+    'fee handler' => 'uc_stripe',
+    'process callback' => 'uc_stripe_process',
+    'renew callback' => 'uc_stripe_renew',
+    'cancel callback' => 'uc_stripe_cancel',
+    'own handler' => FALSE,
+    'menu' => array(
+      'charge' => UC_RECURRING_MENU_DEFAULT,
+      'edit' => UC_RECURRING_MENU_DEFAULT,
+      'cancel' => UC_RECURRING_MENU_DEFAULT,
+    ),
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_order_pane().
+ */
+function uc_stripe_uc_order_pane() {
+  $panes[] = array(
+    'id' => 'uc_stripe',
+    'callback' => 'uc_stripe_order_pane_stripe',
+    'title' => t('Stripe Customer Info'),
+    'desc' => t('Stripe Information'),
+    'class' => 'pos-left',
+    'weight' => 3,
+    'show' => array('view', 'edit'),
+  );
+
+  return $panes;
+}
+
+/**
+ * Implements uc_order_pane_callback() specified in 'callback' of
+ * uc_stripe_uc_order_pane()
+ */
+function uc_stripe_order_pane_stripe($op, $order, &$form = NULL, &$form_state = NULL) {
+  switch ($op) {
+    case 'view':
+      $stripe_customer_id = uc_stripe_get_customer_id($order->uid);
+      $output = t('Customer ID: @cust_id', array('@cust_id' => $stripe_customer_id));
+      return array('#markup' => $output);
+  }
+}
+
+/**
+ * Implements hook_uc_checkout_pane().
+ */
+function uc_stripe_uc_checkout_pane() {
+  $panes['payment-stripe'] = array(
+    'callback' => 'uc_stripe_payment_pane_callback',
+    'title' => t('Payment Information'),
+    'desc' => t('Accept stripe payment from customer.'),
+    'weight' => 6,
+    'process' => FALSE,
+    'collapsible' => FALSE,
+  );
+  return $panes;
+}
+
+/**
+ * Implements uc_checkout_pane_callback() specified in 'callback' of
+ * uc_stripe_uc_checkout_pane()
+ *
+ * Provides empty pane for stripe elements to be added
+ * @param $op
+ * @param $order
+ * @param $form
+ * @param $form_state
+ * @return array
+ */
+function uc_stripe_payment_pane_callback($op, $order, $form = NULL, &$form_state = NULL) {
+  // Create separate payment pane for stripe because the normal payment pane is refreshed many times
+  // by ajax, by country changes, etc.. Refreshing the payment section triggers Stripe API's security feature
+  // and destroys the Stripe Element in the DOM.
+  // Emtpy values needed so that pane still appears.
+  switch ($op) {
+    case 'view':
+      $contents['stripe_card_element'] = array(
+        '#markup' => '',
+      );
+
+      return array('description' => '', 'contents' => $contents);
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for uc_cart_checkout_form().
+ *
+ * @see uc_cart_checkout_form()
+ */
+function uc_stripe_form_uc_cart_checkout_form_alter(&$form, &$form_state) {
+
+  $form['panes']['payment-stripe']['#attached']['css'][] = array(
+      'data' => '#payment-stripe-pane { display: none; }',
+      'type' => 'inline',
+  );
+
+  $form['panes']['payment-stripe']['#states'] = array(
+    'visible' => array(
+      ':input[name="panes[payment][payment_method]"]' => array(
+        'value' => 'credit'
+      )
+    )
+  );
+
+  // Markup text will not be displayed when JS and stripe are functioning properly
+  // since Stripe Elements will replace the contents of this div
+  $form['panes']['payment-stripe']['details']['stripe_card_element'] = array(
+    '#prefix' => '<div id="stripe-card-element">',
+    '#weight' => - 10,
+    '#markup' => '<div class="stripe-warning">' . t('Sorry, for security reasons your card cannot be processed. Please refresh this page and try again. If the problem persists please check that Javascript is enabled your browser.') . '</div>',
+    '#suffix' => '</div>',
+  );
+
+  // Powered by Stripe (logo from https://stripe.com/about/resources)
+  if (variable_get('uc_stripe_poweredby', FALSE)) {
+    $form['panes']['payment']['details']['field_message'] = array(
+      '#type' => 'item',
+      '#markup' => "<a target='_blank' href='http://stripe.com'><img src=" .
+        '/' . drupal_get_path('module', 'uc_stripe') . '/images/solid-dark.svg'
+        . " alt='Powered by Stripe'></a>",
+      '#weight' => 1,
+    );
+  }
+
+  // Used for payment method ID when retrieved from stripe.
+  $form['panes']['payment-stripe']['details']['stripe_payment_method'] = array(
+    '#type' => 'hidden',
+    '#default_value' => 'default',
+    '#attributes' => array(
+      'id' => 'edit-panes-stripe-payment-details-stripe-payment-method',
+    ),
+  );
+
+  if (empty($form['actions']['continue']['#attributes'])) {
+    $form['actions']['continue']['#attributes'] = array();
+  }
+  $form['actions']['continue']['#attributes']['disabled'] = 'disabled';
+
+  // Adds custom JS and CSS
+  $form['#attached']['js'][] = array(
+    'type' => 'external',
+    'data' => 'https://js.stripe.com/v3/',
+  );
+  $form['#attached']['js'][] = array(
+    'data' => array(
+      'uc_stripe' => array(
+        'apikey' => uc_stripe_get_key(),
+        'testmode' => variable_get('uc_stripe_testmode'),
+      )
+    ),
+    'type' => 'setting'
+  );
+  $path = drupal_get_path('module', 'uc_stripe');
+  $form['#attached']['js'][] = $path . '/js/uc_stripe.js';
+  $form['#attached']['css'][] = $path . '/css/uc_stripe.css';
+
+  // hide cc fields and set defaults since we rely fully on stripe's dynamic cc fields
+  $form['panes']['payment']['details']['cc_number']['#type'] = 'hidden';
+  $form['panes']['payment']['details']['cc_number']['#default_value'] = '';
+  $form['panes']['payment']['details']['cc_number']['#attributes']['id']
+    = 'edit-panes-payment-details-cc-number';
+
+  $form['panes']['payment']['details']['cc_cvv']['#type'] = 'hidden';
+  $form['panes']['payment']['details']['cc_cvv']['#default_value'] = '';
+  $form['panes']['payment']['details']['cc_cvv']['#attributes']['id']
+    = 'edit-panes-payment-details-cc-cvv';
+
+  $form['panes']['payment']['details']['cc_exp_year']['#type'] = 'hidden';
+  $form['panes']['payment']['details']['cc_exp_year']['#attributes']['id']
+    = 'edit-panes-payment-details-cc-exp-year';
+
+  //Stripe CC expiration can be up to 50 years in future. The normal ubercart  select
+  // options only go up to 20 years in the future.
+  $min = intval(date('Y'));
+  $max = intval(date('Y')) + 50;
+  $default = intval(date('Y'));
+
+  $form['panes']['payment']['details']['cc_exp_year']['#options']
+    = drupal_map_assoc(range($min, $max));
+  $form['panes']['payment']['details']['cc_exp_year']['#default_value'] = $default;
+
+  $form['panes']['payment']['details']['cc_exp_month']['#type'] = 'hidden';
+  $form['panes']['payment']['details']['cc_exp_month']['#default_value'] = 1;
+  $form['panes']['payment']['details']['cc_exp_month']['#attributes']['id']
+    = 'edit-panes-payment-details-cc-exp-month';
+
+  // Add custom submit which will do saving away of token during submit.
+  $form['#submit'][] = 'uc_stripe_checkout_form_submit';
+
+  // Add a section for stripe.js error messages (CC validation, etc.)
+  $form['panes']['messages'] = array(
+    '#markup' => "<div id='uc_stripe_messages' class='messages error hidden'></div>",
+  );
+
+  //Clears any previous card payment failures
+  if (isset($_SESSION['stripe']['payment_failed'])) {
+    unset($_SESSION['stripe']['payment_failed']);
+  }
+
+  if (uc_credit_default_gateway() == 'uc_stripe') {
+    if (variable_get('uc_stripe_testmode', TRUE)) {
+      $form['panes']['testmode'] = array(
+        '#prefix' => "<div class='messages' style='background-color:#BEEBBF'>",
+        '#markup' => t('Test mode is <strong>ON</strong> for the Stripe Payment Gateway. Your card will not be charged. To change this setting, edit the <a href="@link">Stripe settings</a>',
+          array('@link' => url('admin/store/settings/payment/method/credit'))),
+        '#suffix' => "</div>",
+      );
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for uc_cart_checkout_review_form().
+ *
+ * @see uc_cart_checkout_review_form()
+ */
+function uc_stripe_form_uc_cart_checkout_review_form_alter(&$form, &$form_state, $form_id) {
+  //This alter hook should only take action when payment method is credit.
+  if ($form_state['uc_order']->payment_method != 'credit') {
+    return;
+  }
+
+  // If payment method is not found, hide submit button, and show error to user
+  if (empty($_SESSION['stripe']['payment_method'])) {
+    $form['actions']['submit']['#type'] = 'hidden';
+    $fail_message = variable_get('uc_credit_fail_message', t('We were unable to process your credit card payment. Please verify your details and try again.  If the problem persists, contact us to complete your order.'));
+    watchdog(
+      'uc_stripe',
+      'Stripe charge failed for order @order, message: @message',
+      array(
+        '@order' => $form_state['uc_order']->order_id,
+        '@message' => 'Payment method not found'
+      )
+    );
+    drupal_set_message(check_plain($fail_message), 'error');
+    return;
+  }
+
+  // When a payment fails, remove the Submit Order button because it will most
+  // likely fail again. Instead, the customer should hit back to try again.
+  if (isset($_SESSION['stripe']['payment_failed'])) {
+    $form['actions']['submit']['#type'] = 'hidden';
+  }
+
+  //Attach Stripe v3 JS library and JS for processing payment
+  $form['#attached']['js'][] = array(
+    'type' => 'external',
+    'data' => 'https://js.stripe.com/v3/',
+  );
+
+  $form['#attached']['js'][] = array(
+    'data' => array(
+      'uc_stripe' => array(
+        'methodId' => $_SESSION['stripe']['payment_method'],
+        'apikey' => uc_stripe_get_key(),
+        'orderId' => $form_state['uc_order']->order_id
+      )
+    ),
+    'type' => 'setting'
+  );
+  $form['#attached']['js'][] = drupal_get_path('module', 'uc_stripe') . '/js/uc_stripe_process_payment.js';
+}
+
+/**
+ * Custom submit function to store the stripe token
+ *
+ * Since we don't have a user account at this step, we're going to store the token
+ * in the session. We'll grab the token in the charge callback and use it to charge
+ */
+function uc_stripe_checkout_form_submit($form, &$form_state) {
+  // This submit may be entered on another payment type, so don't set session in that case.
+  if (!empty($form_state['values']['panes']['payment-stripe']['details']['stripe_payment_method'])) {
+    $_SESSION['stripe']['payment_method'] = $form_state['values']['panes']['payment-stripe']['details']['stripe_payment_method'];
+  }
+}
+
+
+/**
+ * Implements hook_uc_checkout_complete().
+ */
+function uc_stripe_uc_checkout_complete($order, $account) {
+  if ($order->payment_method == 'credit') {
+    if (!empty($order->data['stripe_customer_id']) && !empty($order->data['stripe_payment_id'])) {
+      // Pull the stripe payment method ID from the session.
+      // It got there in uc_stripe_checkout_form_submit()
+
+      user_save(
+        $account,
+        array(
+          'data' => array(
+            'uc_stripe_customer_id' => $order->data['stripe_customer_id'],
+            'uc_stripe_payment_id' => $order->data['stripe_payment_id'],
+          ),
+        )
+      );
+    }
+  }
+}
+
+
+/**
+ * Generic "charge" callback that runs on checkout and via the order's "card" terminal
+ *
+ * @return array
+ */
+function uc_stripe_charge($order_id, $amount, $data) {
+  global $user;
+
+  //  Loads the stripe PHP API
+  if (!uc_stripe_prepare_api()) {
+    $result = array(
+      'success' => FALSE,
+      'comment' => t('Stripe API not found.'),
+      'message' => t('Stripe API not found. Contact the site administrator.'),
+      'uid' => $user->uid,
+      'order_id' => $order_id,
+    );
+    return $result;
+  }
+
+  $order = uc_order_load($order_id, TRUE);
+
+  // Format the amount in cents, which is what Stripe wants
+  $amount = uc_currency_format($amount, FALSE, FALSE, FALSE);
+
+  // Stripe can't handle transactions < $0.50, but $0 is a common value
+  // so we will just return a positive result when the amount is $0.
+  if ($amount == 0) {
+    $result = array(
+      'success' => TRUE,
+      'message' => t('Payment of $0 approved'),
+      'uid' => $user->uid,
+      'trans_id' => md5(uniqid(rand())),
+    );
+    uc_order_comment_save($order_id, $user->uid, $result['message'], 'admin');
+    return $result;
+  }
+
+  // Rexamine Payment Intent and Record payment or failure to the customer
+  try {
+
+    if (empty($order->data['stripe_payment_intent_id'])) {
+      throw new Exception('The Payment Intent is empty.');
+    }
+    $intent_id = $order->data['stripe_payment_intent_id'];
+
+    // charge the Customer the amount in the order
+    $payment_intent = \Stripe\PaymentIntent::retrieve($intent_id);
+
+    if ($payment_intent->status != 'succeeded') {
+      drupal_set_message(
+        $payment_intent->last_payment_error->message,
+        'warning'
+      );
+      throw new Exception($payment_intent->last_payment_error->message);
+    }
+
+    $pi_id = $payment_intent->id;
+    $formatted_amount = number_format($amount / 100, 2);
+
+    $result = array(
+      'success' => TRUE,
+      'message' => t('Payment of @amount processed successfully, Stripe transaction id @transaction_id.',
+        array('@amount' => $formatted_amount, '@transaction_id' => $pi_id)),
+      'comment' => t('Stripe transaction ID: @transaction_id',
+        array('@transaction_id' => $pi_id)),
+      'uid' => $user->uid,
+      'log_payment' => FALSE // This field doesn't call uc_payment_enter()
+    );
+
+    uc_order_comment_save($order_id, $user->uid, $result['message'], 'admin');
+    uc_order_comment_save($order_id, $user->uid, $result['message'], 'order', 'completed', FALSE);
+
+    return $result;
+  }
+  catch (Exception $e) {
+    $result = array(
+      'success' => FALSE,
+      'comment' => $e->getCode(),
+      'message' => t('Stripe Charge Failed for order @order: @message',
+        array(
+          '@order' => $order_id,
+          '@message' => $e->getMessage()
+        )
+      ),
+      'uid' => $user->uid,
+      'order_id' => $order_id,
+    );
+    uc_order_comment_save($order_id, $user->uid, $result['message'], 'admin');
+    watchdog(
+      'uc_stripe',
+      'Stripe charge failed for order @order, message: @message',
+      array('@order' => $order_id, '@message' => $result['message']),
+      WATCHDOG_ERROR
+    );
+
+    $_SESSION['stripe']['payment_failed'] = TRUE;
+
+    return $result;
+  }
+}
+
+/**
+ * Handle renewing a recurring fee, called by uc_recurring
+ *
+ * Runs when the subscription interval is hit. So once a month or whatever.
+ * This just charges the stripe customer whatever amount ubercart wants. It does
+ * not use the Stripe subscription feature.
+ *
+ * @param $order
+ * @param $fee
+ * @return bool
+ */
+function uc_stripe_renew($order, &$fee) {
+
+  try {
+    //Loads the API
+
+    if (!uc_stripe_prepare_api()) {
+      throw new Exception('Stripe API not found.');
+    }
+
+    $account = user_load($order->uid);
+    if (empty($account)) {
+      throw new Exception(
+        format_string('User ID #@uid. Account does not exit.',
+          array('@uid' => $order->uid)
+        )
+      );
+    }
+
+    //Gets the customer ID
+    if (empty($account->data['uc_stripe_customer_id'])) {
+      throw new Exception('No stripe customer ID found.');
+    }
+    $stripe_customer_id = $account->data['uc_stripe_customer_id'];
+
+    if (empty($account->data['uc_stripe_payment_id'])) {
+      throw new Exception('No stripe payment ID found.');
+    }
+    $stripe_payment_id = $account->data['uc_stripe_payment_id'];
+
+    $amount = $fee->fee_amount * 100;
+
+    // Creates params for intent.
+    $intent_params = array(
+      'amount' => $amount,
+      'currency' => strtolower($order->currency),
+      'payment_method_types' => array('card'),
+      'customer' => $stripe_customer_id,
+      'off_session' => TRUE,
+      'confirm' => TRUE,
+      'payment_method' => $stripe_payment_id,
+      'metadata' => array(
+        'order_id' => $order->order_id,
+        'recurring' => 1,
+        'parent_order_id' => $fee->order_id,
+      ),
+    );
+    $params = array(
+      'intent_params' => $intent_params,
+      'order' => $order
+    );
+    drupal_alter('uc_stripe_renew_params', $params);
+    $intent_params = $params['intent_params'];
+
+    $payment_intent = \Stripe\PaymentIntent::create($intent_params);
+    $order->data['stripe_payment_intent_id'] = $payment_intent->id;
+    uc_order_save($order);
+
+    return TRUE;
+  }
+  catch (\Stripe\Error\Card $e) {
+    if ($e->getDeclineCode() === 'authentication_required') {
+      // Creates and stores hash so that we can prompt user to authenticate payment.
+      $hash = drupal_hmac_base64(
+        REQUEST_TIME . $order->order_id,
+        drupal_get_hash_salt() . $stripe_payment_id
+      );
+      $item = array(
+        'order_id' => $order->order_id,
+        'completed' => UC_STRIPE_NOT_COMPLETED,
+        'rfee_id' => $fee->rfid,
+        'hash' => $hash
+      );
+      drupal_write_record('uc_stripe_pending_auth', $item);
+
+      // Prepares email to alert user that authentication is required.
+      $params = array(
+        'body' => variable_get(
+          'uc_stripe_authentication_required_email',
+          uc_stripe_get_authentication_required_email_text()
+        ),
+        'subject' => variable_get(
+          'uc_stripe_authentication_required_email_subject',
+          t('Subject of Email for Recurring payment authentication')
+        ),
+      );
+
+      $params['user'] = user_load($order->uid);
+      $params['hash'] = $hash;
+      drupal_mail(
+        'uc_stripe',
+        'authentication_required',
+        $params['user']->mail,
+        user_preferred_language($params['user']),
+        $params
+      );
+
+    };
+
+    $message = t('Renewal Failed for order @order: @message',
+      array(
+        '@order' => $order->order_id,
+        '@message' => $e->getMessage()
+      )
+    );
+
+    uc_order_comment_save($order->order_id, $order->uid, $message, 'admin');
+    watchdog(
+      'uc_stripe',
+      'Renewal failed for order @order_id, code=@code, message: @message',
+      array(
+        '@order_id' => $order->order_id,
+        '@code' => $e->getCode(),
+        '@message' => $e->getMessage()
+      )
+    );
+  }
+  catch (Exception $e) {
+    watchdog(
+      'uc_stripe',
+      'Renewal failed for order @order_id, code=@code, message: @message',
+      array(
+        '@order_id' => $order->order_id,
+        '@code' => $e->getCode(),
+        '@message' => $e->getMessage()
+      )
+    );
+  }
+  module_invoke_all('uc_stripe_renew_failed', $order, $fee);
+
+  return FALSE;
+}
+
+/**
+ * UC Recurring: Process a new recurring fee.
+ * This runs when subscriptions are "set up" for the first time.
+ * There is no action to be taken here except returning TRUE because the customer
+ * ID is already stored with the user, where it can be accessed when next charge
+ * takes place.
+ *
+ * @param $order
+ * @param $fee
+ * @return bool
+ */
+function uc_stripe_process($order, &$fee) {
+  return TRUE;
+}
+
+/**
+ * UC Recurring: Cancel a recurring fee.
+ * This runs when subscriptions are cancelled
+ * Since we're handling charge intervals in ubercart, this doesn't need to do anything.
+ *
+ * @param $order
+ * @param $op
+ * @return bool
+ */
+function uc_stripe_cancel($order, $op) {
+  uc_order_comment_save(
+    $order->order_id,
+    $order->uid,
+    'Subscription Canceled',
+    'order',
+    'completed'
+  );
+  module_invoke_all('uc_stripe_subscription_canceled', $order);
+  return TRUE;
+}
+
+/**
+ * Ajax page callback for callback uc_stripe/ajax/confirm_payment page
+ * This is used to send payment and intent status back to JS client
+ * @return string Json response
+ */
+function uc_stripe_confirm_payment() {
+
+
+  # retrieve json from POST body
+  $data = $_POST;
+
+  if (empty($data['order_id'])) {
+    $message = 'Empty data';
+    watchdog(
+      'uc_stripe',
+      $message,
+      array(),
+      WATCHDOG_CRITICAL
+    );
+    return uc_stripe_confirm_payment_error($message);
+  }
+
+  $order_id = $data['order_id'];
+  $order = uc_order_load($order_id, TRUE);
+
+  if (empty($order)) {
+    $message = format_string(
+      'Order ID #@order_id. Order does not exist.',
+      array('@order_id' => $order_id)
+    );
+    watchdog(
+      'uc_stripe',
+      $message,
+      array(),
+      WATCHDOG_CRITICAL
+    );
+
+    return uc_stripe_confirm_payment_error($message);
+  }
+
+  if (!uc_stripe_prepare_api()) {
+    $message = 'Stripe API not found.';
+    watchdog(
+      'uc_stripe',
+      'Error in Stripe API: @message',
+      array('@message' => $message),
+      WATCHDOG_CRITICAL
+    );
+
+    return uc_stripe_confirm_payment_error($message);
+  }
+
+  if (!empty($order->data['stripe_customer_id'])) {
+    $stripe_customer_id = $order->data['stripe_customer_id'];
+
+  }
+  else {
+    $account = user_load_by_mail($order->primary_email);
+
+    if (empty($account)) {
+      // If doesn't exist account, then has to generate stripe_id.
+      $stripe_customer_id = FALSE;
+
+    }
+    else {
+      $stripe_customer_id = uc_stripe_get_customer_id($account->uid);
+
+      // Does it check valid or not valid stripe_id?
+      if (!uc_stripe_is_stripe_id_valid($stripe_customer_id)) {
+        watchdog(
+          'uc_stripe',
+          'Stripe customer: @customer is not valid in this instance of Stripe. A new customer will be created.',
+          array('@customer' => $stripe_customer_id)
+        );
+        $stripe_customer_id = FALSE;
+      }
+    }
+
+    if (empty($stripe_customer_id)) {
+      $customer = uc_stripe_create_stripe_customer($order);
+
+      if (empty($customer)) {
+        $message = 'Customer creation failed.';
+        return uc_stripe_confirm_payment_error($message);
+      }
+      $stripe_customer_id = $customer->id;
+    }
+
+    $order->data['stripe_customer_id'] = $stripe_customer_id;
+  }
+
+  try {
+    if (!empty($data['stripe_payment_method_id'])) {
+      // Format the amount in cents, which is what Stripe wants
+
+      $params = array(
+        'payment_method' => $data['stripe_payment_method_id'],
+        'description' => t('Order #@order_id', array('@order_id' => $order_id)),
+        // Format the amount in cents, which is what Stripe wants
+        'amount' => uc_currency_format($order->order_total, FALSE, FALSE, FALSE),
+        'currency' => strtolower($order->currency),
+        'confirmation_method' => 'manual',
+        'confirm' => TRUE,
+        'setup_future_usage' => 'off_session',
+        'save_payment_method' => TRUE,
+        'customer' => $stripe_customer_id,
+        'metadata' => array(
+          'order_id' => $order->order_id,
+        ),
+      );
+
+      // Allows other modules to change parameters
+      drupal_alter('uc_stripe_create_payment_intent', $params);
+
+      // Creates the PaymentIntent
+      $intent = \Stripe\PaymentIntent::create($params);
+
+      $order->data['stripe_payment_id'] = $data['stripe_payment_method_id'];
+      $order->data['stripe_payment_intent_id'] = $intent->id;
+
+      uc_order_save($order);
+    }
+
+    // @TODO Check how often this case happen?
+    if (!empty($data['stripe_payment_intent_id'])) {
+      $intent = \Stripe\PaymentIntent::retrieve($data['stripe_payment_intent_id']);
+      if ($intent->status != 'succeeded') {
+        $intent->confirm();
+      }
+    }
+
+    if (!empty($intent)) {
+      return uc_stripe_generate_payment_response($intent);
+    }
+
+    $message = 'Customer creation failed.';
+    return uc_stripe_confirm_payment_error($message);
+  }
+  catch (Exception $e) {
+    $message = 'OrderID #@order_id. Payment could not be processed: @message';
+    $var = array('@order_id' => $order_id, '@message' => $e->getMessage());
+    watchdog('uc_stripe', $message, $var, WATCHDOG_CRITICAL);
+    return uc_stripe_confirm_payment_error(format_string($message, $var));
+  }
+}
+
+/**
+ * Creates custom in Stripe.
+ *
+ * @param object $order
+ *   A full-loaded object Order.
+ *
+ * @return mixed
+ *   Object - if customer was created.
+ *   FALSE - customer was not created.
+ */
+function uc_stripe_create_stripe_customer($order) {
+
+  try {
+    // If the token is not in the user's session, we can't set up a new customer
+    global $base_url;
+
+    $params = array(
+      'description' => format_string(
+        'Site: @sitename, OrderID: #@order_id',
+        array(
+          '@sitename' => $base_url,
+          '@order_id' => $order->order_id,
+        )
+      ),
+      'email' => $order->primary_email,
+    );
+    $fields = array(
+      'billing' => array(
+        'address' => array('street1', 'street2', 'city', 'postal_code', 'country'),
+        'name' => array('first_name', 'last_name')
+      )
+    );
+
+    foreach ($fields as $key => $items) {
+      foreach ($items as $param_key => $suffixes) {
+        foreach ($suffixes as $suffix) {
+          $field_name = $key . '_' . $suffix;
+          if (!empty($order->$field_name)) {
+            $field_value = $order->$field_name;
+            if (strpos($field_name, 'country') !== FALSE) {
+              $field_value = uc_get_country_data(
+                array('country_id' => $order->$field_name)
+              );
+              $condition = !empty($field_value) && !empty($field_value[0])
+                && !empty($field_value[0]['country_iso_code_2']);
+              if ($condition) {
+                $field_value = $field_value[0]['country_iso_code_2'];
+              }
+            }
+            if ($suffix == 'street1') {
+              $suffix = 'line1';
+            }
+            if ($suffix == 'street2') {
+              $suffix = 'line2';
+            }
+            $params[$param_key][$suffix] = $field_value;
+          }
+
+        }
+      }
+    }
+    if (!empty($params['name'])) {
+      $params['name'] = implode(' ', $params['name']);
+    }
+
+    if (empty($params['address']['line1'])) {
+      // @TODO change  to default address
+      $params['address']['line1'] = 'avenue';
+    }
+
+    // Allows other modules to change parameters
+    drupal_alter('uc_stripe_customer_create_param', $params);
+
+    //Creates the customer in stripe
+    $customer = \Stripe\Customer::create($params);
+
+    return $customer;
+  }
+  catch (Exception $e) {
+    $message = t('Stripe Customer Creation Failed for order @order: @message',
+      array(
+        '@order' => $order->order_id,
+        '@message' => $e->getMessage()
+      )
+    );
+
+    uc_order_comment_save($order->order_id, 0, $message, 'admin');
+
+    watchdog(
+      'uc_stripe',
+      'Failed stripe customer creation: @message',
+      array('@message' => $message),
+      WATCHDOG_ERROR
+    );
+
+    return FALSE;
+  }
+
+}
+
+/**
+ * Checks Stripe's identifier.
+ *
+ * @param string $stripe_id
+ *   Stripe's unique customer identifier.
+ *
+ * @return boolean result - if stripe_id is valid based on stripe api customer call
+ */
+function uc_stripe_is_stripe_id_valid($stripe_id) {
+  try{
+    $customer = \Stripe\Customer::retrieve($stripe_id);
+    if (!empty($customer) && !$customer->deleted) {
+      return TRUE;
+    }
+
+    return FALSE;
+  }
+  catch (Exception $e) {
+    // IF customer is not found, an exception is thrown.
+    return FALSE;
+  }
+}
+
+/**
+ * Loads stripe API
+ *
+ * @return bool
+ */
+function uc_stripe_prepare_api() {
+
+  if (!uc_stripe_load_library()) {
+    return FALSE;
+  }
+
+  if (!uc_stripe_check_api_keys()) {
+    watchdog(
+      'uc_stripe',
+      'Stripe API keys are not configured. Payments cannot be made without them.',
+      array(),
+      WATCHDOG_ERROR
+    );
+    return FALSE;
+  }
+
+  $secret_key = uc_stripe_get_key('secret');
+  try {
+    $library = libraries_load('stripe');
+    \Stripe\Stripe::setApiKey($secret_key);
+    \Stripe\Stripe::setApiVersion($library['stripe_api_version']);
+  }
+  catch (Exception $e) {
+    watchdog(
+      'uc_stripe',
+      'Error setting the Stripe API Key. Payments will not be processed: @error.',
+      array('@error' => $e->getMessage()),
+      WATCHDOG_ERROR
+    );
+  }
+
+  try{
+    $module_info = system_get_info('module', 'uc_stripe');
+    $uc_stripe_version = is_null($module_info['version']) ? 'dev-unknown' : $module_info['version'];
+    \Stripe\Stripe::setAppInfo('Drupal Ubercart Stripe', $uc_stripe_version, 'https://www.drupal.org/project/uc_stripe');
+  }
+  catch (Exception $e) {
+    watchdog(
+      'uc_stripe',
+      'Error setting Stripe plugin information: @error',
+      array('@error' => $e->getMessage())
+    );
+  }
+  return TRUE;
+}
+
+/**
+ * Implements hook_mail().
+ */
+function uc_stripe_mail($key, &$message, $params) {
+
+  if (!variable_get('uc_stripe_emails_enabled', TRUE)) {
+    $message['send'] = FALSE;
+  }
+  else {
+    switch ($key) {
+      case 'authentication_required' :
+
+        $message['subject'] = $params['subject'];
+        $message['body'][] = token_replace(
+          $params['body'],
+          array(
+            'user' => $params['user'],
+            'authentication_key' => $params['hash']
+          ),
+          array(
+            'language' => language_default(),
+            'callback' => 'uc_stripe_mail_tokens',
+            'sanitize' => FALSE,
+            'clear' => TRUE
+          )
+        );
+        break;
+    }
+  }
+}
+
+/**
+ * Stripe's Webhook,
+ *
+ * @see https://stripe.com/docs/webhooks
+ *
+ */
+function uc_stripe_endpoint() {
+  try {
+    if (!uc_stripe_prepare_api()) {
+      throw new Exception('Stripe API not found.');
+    }
+
+    $payload = @file_get_contents('php://input');
+    if (empty($payload)) {
+      throw new Exception('$_POST is empty.');
+    }
+
+    if (empty($_SERVER['HTTP_STRIPE_SIGNATURE'])) {
+      throw new Exception("Stripe's signature is empty.");
+    }
+    $sig_header = $_SERVER['HTTP_STRIPE_SIGNATURE'];
+
+    $event = \Stripe\Webhook::constructEvent(
+      $payload, $sig_header, variable_get('uc_stripe_secret')
+    );
+
+    if (!isset($event->data->object->metadata['order_id'])) {
+      throw new Exception('Order is undefined in metadata.');
+    }
+
+    $order = uc_order_load($event->data->object->metadata['order_id'], TRUE);
+
+    $suffix_log = 'Event ID: #@event_id. PaymentIntent ID: @pi_id. Order: #@order_id.';
+    $var_log = ['@event_id' => $event->id, '@order_id' => $order->order_id, '@pi_id' => $event->data->object->id];
+
+    switch ($event->type) {
+      case 'payment_intent.amount_capturable_updated':
+        break;
+      case 'payment_intent.canceled':
+        //  Occurs when a PaymentIntent is canceled.
+        break;
+      case 'payment_intent.created':
+        // Occurs when a new PaymentIntent is created.
+        break;
+      case 'payment_intent.payment_failed':
+        // Occurs when a PaymentIntent has failed the attempt to create a source or a payment.
+        watchdog(
+          'uc_stripe',
+          'Received Payment Failed from Stripe. ' . $suffix_log,
+          $var_log,
+          WATCHDOG_WARNING
+        );
+        break;
+      case 'payment_intent.succeeded':
+        $amount = number_format($event->data->object->amount / 100, 2);
+
+        // Occurs when a PaymentIntent has successfully completed payment.
+        if (uc_payment_balance($order) > 0 && isset($event->data->object->amount)) {
+          uc_payment_enter(
+            $order->order_id,
+            $order->payment_method,
+            $amount,
+            $order->uid,
+            NULL,
+            t('Payment received from Stripe. Event ID: @event_id. PaymentIntent ID: @pi_id.', ['@event_id' => $event->id, '@pi_id' => $event->data->object->id])
+          );
+        }
+
+        if (isset($event->data->object->metadata['recurring']) && isset($event->data->object->metadata['parent_order_id'])) {
+          if ($event->data->object->metadata['recurring']) {
+            $parent_order_id = $event->data->object->metadata['parent_order_id'];
+
+            $message = t('Card renewal payment of @amount processed successfully.',
+              array('@amount' => $amount)
+            );
+            uc_order_comment_save($parent_order_id, $order->uid, $message, 'order', 'completed', FALSE);
+            uc_order_comment_save($parent_order_id, $order->uid, $message, 'admin');
+          }
+        }
+
+        break;
+      default:
+        watchdog(
+          'uc_stripe',
+          'Type (@type) of event is not support. ' . $suffix_log,
+          array_merge(['@type' => $event->type], $var_log),
+          WATCHDOG_WARNING
+        );
+    }
+
+    drupal_add_http_header('Status', '200 OK');
+    drupal_exit();
+  }
+  catch(\Stripe\Error\SignatureVerification $e) {
+    $arg_error = [
+      '@error_message' => $e->getMessage(),
+    ];
+  }
+  catch (Exception $e) {
+    $arg_error = [
+      '@error_message' => $e->getMessage(),
+    ];
+  }
+
+  watchdog(
+    'uc_stripe',
+    'Error: @error_message.',
+    $arg_error,
+    WATCHDOG_ERROR
+  );
+
+  drupal_add_http_header('Status', '500 Internal Server Error');
+  echo '500 Internal Server Error';
+  drupal_exit();
+
+}
